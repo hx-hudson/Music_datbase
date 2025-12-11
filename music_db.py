@@ -7,11 +7,11 @@ from typing import Tuple, List, Set
 
 def _get_or_create_artist(mydb, artist_name: str) -> int:
     """
-    返回 artist_id，如果不存在则创建。
+    Return artist_id; if the artist does not exist, create it.
 
-    假设 Artist 表结构为：
+    Assumes the Artist table has the following schema:
         Artist(artist_id PK AUTO_INCREMENT, name UNIQUE NOT NULL)
-    （没有 is_group 列）
+    (There is no is_group column.)
     """
     cur = mydb.cursor()
     cur.execute("SELECT artist_id FROM Artist WHERE name = %s", (artist_name,))
@@ -19,13 +19,14 @@ def _get_or_create_artist(mydb, artist_name: str) -> int:
     if row:
         return row[0]
 
+    # Insert new artist
     cur.execute("INSERT INTO Artist (name) VALUES (%s)", (artist_name,))
     mydb.commit()
     return cur.lastrowid
 
 
 def _get_artist_id(mydb, artist_name: str):
-    """返回 artist_id，不存在则返回 None。"""
+    """Return artist_id; if not found, return None."""
     cur = mydb.cursor()
     cur.execute("SELECT artist_id FROM Artist WHERE name = %s", (artist_name,))
     row = cur.fetchone()
@@ -33,7 +34,7 @@ def _get_artist_id(mydb, artist_name: str):
 
 
 def _get_or_create_genre(mydb, genre_name: str) -> int:
-    """返回 genre_id，如果不存在则创建。"""
+    """Return genre_id; create the genre if it does not exist."""
     cur = mydb.cursor()
     cur.execute("SELECT genre_id FROM Genre WHERE name = %s", (genre_name,))
     row = cur.fetchone()
@@ -46,7 +47,7 @@ def _get_or_create_genre(mydb, genre_name: str) -> int:
 
 
 def _get_song_id_by_artist_and_title(mydb, artist_id: int, title: str):
-    """通过 artist_id + title 查 song_id，不存在返回 None。"""
+    """Look up song_id by (artist_id, title); return None if not found."""
     cur = mydb.cursor()
     cur.execute(
         "SELECT song_id FROM Song WHERE artist_id = %s AND title = %s",
@@ -57,7 +58,7 @@ def _get_song_id_by_artist_and_title(mydb, artist_id: int, title: str):
 
 
 def _get_user_id(mydb, username: str):
-    """返回 user_id，不存在返回 None。"""
+    """Return user_id; return None if not found."""
     cur = mydb.cursor()
     cur.execute("SELECT user_id FROM User WHERE username = %s", (username,))
     row = cur.fetchone()
@@ -65,7 +66,7 @@ def _get_user_id(mydb, username: str):
 
 
 # ----------------------
-# 1. 清空数据库
+# 1. Clear all tables in the database
 # ----------------------
 
 def clear_database(mydb):
@@ -79,63 +80,62 @@ def clear_database(mydb):
     """
     cur = mydb.cursor()
 
-    # 有外键依赖的子表先删，再删父表
-    # Rating -> Song / User
-    # SongGenre -> Song / Genre
-    # Song -> Album / Artist
-    # Album -> Artist / Genre
-    for table in ["Rating", "SongGenre", "Song", "Album", "User", "Genre", "Artist"]:
-        cur.execute(f"DELETE FROM {table}")
-
+    # Delete child tables that have foreign keys before deleting parent tables
+    tables = ["Rating", "SongGenre", "Song", "Album", "User", "Genre", "Artist"]
+    for t in tables:
+        cur.execute(f"DELETE FROM {t}")
     mydb.commit()
 
 
 # ----------------------
-# 2. 加载单曲
+# 2. Load single songs
 # ----------------------
 
 def load_single_songs(
-    mydb,
-    single_songs: List[Tuple[str, Tuple[str, ...], str, str]],
+    mydb, single_songs: List[Tuple[str, Tuple[str, ...], str, str]]
 ) -> Set[Tuple[str, str]]:
     """
     Add single songs to the database.
 
+    Single song: a Song with album_id = NULL. A song can have multiple genres,
+    implemented via the SongGenre table.
+
+    If a single song has no genre(s) in the input, it is rejected and not added.
+
     Args:
         mydb: database connection
-
-        single_songs: List of single songs to add. Each single song is a tuple of the form:
-              (song title, genre names, artist name, release date)
-        Genre names is a tuple since a song could belong to multiple genres.
-        Release date is of the form yyyy-mm-dd
+        single_songs: list of 4-tuples:
+            (song_title, genres, artist_name, release_date_string)
 
     Returns:
-        Set[Tuple[str,str]]: set of (song,artist) for combinations that already exist
-        in the database and were not added (rejected).
-        Set is empty if there are no rejects.
+        Set[Tuple[str,str]]: (song_title, artist_name) pairs that were rejected,
+        either because:
+          - this artist already has a song with this title (single or in album), or
+          - the input for this single had no genres
     """
     rejected: Set[Tuple[str, str]] = set()
     cur = mydb.cursor()
 
     for title, genre_names, artist_name, release_date in single_songs:
-        # 单曲：必须至少有一个体裁，否则 reject
+        # Single song: must have at least one genre; otherwise reject
         if not genre_names:
             rejected.add((title, artist_name))
             continue
 
-        # 创建 / 获取 artist
+        # Create or fetch the artist
         artist_id = _get_or_create_artist(mydb, artist_name)
 
-        # 检查 (artist, title) 是否已经存在
+        # Check whether this (artist, title) song already exists
         cur.execute(
             "SELECT song_id FROM Song WHERE artist_id = %s AND title = %s",
             (artist_id, title),
         )
-        if cur.fetchone():
+        row = cur.fetchone()
+        if row:
             rejected.add((title, artist_name))
             continue
 
-        # 插入单曲（album_id 为 NULL；策略 B 下 Song 没有 genre_id）
+        # Insert the single (album_id is NULL; under strategy B Song has no genre_id column)
         cur.execute(
             """
             INSERT INTO Song (title, artist_id, album_id, release_date)
@@ -145,11 +145,11 @@ def load_single_songs(
         )
         song_id = cur.lastrowid
 
-        # 对这首单曲的所有体裁插入 SongGenre（可以多体裁）
-        # 用 set 去重，避免传入重复 genre 名导致违反 (song_id, genre_id) 主键
+        # Insert all genres for this single into SongGenre (a song may have multiple genres)
+        # Use a set to deduplicate genres to avoid violating the (song_id, genre_id) primary key
         unique_genres = set(genre_names)
-        for genre_name in unique_genres:
-            genre_id = _get_or_create_genre(mydb, genre_name)
+        for gname in unique_genres:
+            genre_id = _get_or_create_genre(mydb, gname)
             cur.execute(
                 "INSERT INTO SongGenre (song_id, genre_id) VALUES (%s, %s)",
                 (song_id, genre_id),
@@ -158,8 +158,9 @@ def load_single_songs(
     mydb.commit()
     return rejected
 
+
 # ----------------------
-# 3. 最“高产”的个人歌手（按单曲数）
+# 3. Most prolific individual artists (by number of singles)
 # ----------------------
 
 def get_most_prolific_individual_artists(
@@ -171,7 +172,7 @@ def get_most_prolific_individual_artists(
     Get the top n most prolific individual artists by number of singles released in a year range.
     Break ties by alphabetical order of artist name.
 
-    由于 Artist 表不再有 is_group，这里把所有 artist 都当作 individual 处理。
+    Since the Artist table no longer has an is_group column, we treat all artists as individuals here.
 
     Args:
         mydb: database connection
@@ -184,7 +185,7 @@ def get_most_prolific_individual_artists(
     start_year, end_year = year_range
     cur = mydb.cursor()
 
-    # 只统计单曲：album_id IS NULL
+    # Count only singles: album_id IS NULL
     cur.execute(
         """
         SELECT a.name, COUNT(*) AS num_singles
@@ -198,13 +199,12 @@ def get_most_prolific_individual_artists(
         """,
         (start_year, end_year, n),
     )
-
     rows = cur.fetchall()
     return [(name, count) for (name, count) in rows]
 
 
 # ----------------------
-# 4. 最后一首单曲在某年的歌手
+# 4. Artists whose last single is in the given year
 # ----------------------
 
 def get_artists_last_single_in_year(mydb, year: int) -> Set[str]:
@@ -213,14 +213,14 @@ def get_artists_last_single_in_year(mydb, year: int) -> Set[str]:
 
     Args:
         mydb: database connection
-        year: year of last release
+        year: the year of interest
 
     Returns:
-        Set[str]: set of artist names
+        Set[str]: artist names.
     """
     cur = mydb.cursor()
 
-    # 对每个 artist，找出所有单曲 release_date 的最大值，再过滤年份
+    # For each artist, compute the max release_date over all singles and then filter by year
     cur.execute(
         """
         SELECT a.name, MAX(s.release_date) AS last_date
@@ -232,12 +232,11 @@ def get_artists_last_single_in_year(mydb, year: int) -> Set[str]:
         """,
         (year,),
     )
-
-    return {name for (name, _last_date) in cur.fetchall()}
+    return {name for (name, _) in cur.fetchall()}
 
 
 # ----------------------
-# 5. 加载专辑
+# 5. Load albums
 # ----------------------
 
 def load_albums(
@@ -245,60 +244,61 @@ def load_albums(
     albums: List[Tuple[str, str, str, str, List[str]]],
 ) -> Set[Tuple[str, str]]:
     """
-    Add albums to the database.
+    Add album information to the database.
 
     Args:
         mydb: database connection
-
-        albums: List of albums to add. Each album is a tuple of the form:
-              (album title, genre, artist name, release date, list of song titles)
-        Release date is of the form yyyy-mm-dd
+        albums: list of tuples:
+            (album_title, album_genre, artist_name, release_date_string, song_titles)
 
     Returns:
-        Set[Tuple[str,str]]: set of (album, artist) combinations that were not added (rejected)
-        because the artist already has an album of the same title.
+        Set[Tuple[str,str]]: set of (album_title, artist_name) that could not be added
+        because there is already an album with the same title for that artist.
     """
     rejected: Set[Tuple[str, str]] = set()
     cur = mydb.cursor()
 
     for album_title, album_genre, artist_name, release_date, song_titles in albums:
-        # 创建 / 获取 artist
+        # Create or fetch the artist
         artist_id = _get_or_create_artist(mydb, artist_name)
+        # Album genre (Album still has a genre_id column)
+        genre_id = _get_or_create_genre(mydb, album_genre)
 
-        # 专辑体裁（Album 仍然有 genre_id）
-        album_genre_id = _get_or_create_genre(mydb, album_genre)
-
-        # 检查该 artist 是否已有同名专辑
+        # Check whether this artist already has an album with the same title
         cur.execute(
             "SELECT album_id FROM Album WHERE artist_id = %s AND title = %s",
             (artist_id, album_title),
         )
-        row = cur.fetchone()
-        if row:
+        if cur.fetchone():
             rejected.add((album_title, artist_name))
             continue
 
-        # 插入专辑
+        # Insert the album
         cur.execute(
             """
             INSERT INTO Album (title, artist_id, release_date, genre_id)
             VALUES (%s, %s, %s, %s)
             """,
-            (album_title, artist_id, release_date, album_genre_id),
+            (album_title, artist_id, release_date, genre_id),
         )
         album_id = cur.lastrowid
 
-        # 专辑里的所有歌曲：体裁必须与专辑一致
+        # All songs in the album must have the same genre as the album
         for song_title in song_titles:
-            # 避免冲突：同一 artist + title 已有则跳过该曲目（不拒绝整张专辑）
+            # Avoid conflicts: if this (artist, title) song already exists, skip this track (do not reject the whole album)
             cur.execute(
-                "SELECT song_id FROM Song WHERE artist_id = %s AND title = %s",
+                """
+                SELECT song_id FROM Song
+                WHERE artist_id = %s AND title = %s
+                """,
                 (artist_id, song_title),
             )
-            if cur.fetchone():
+            row = cur.fetchone()
+            if row:
+                # Song already exists, skip
                 continue
 
-            # 插入 Song（无 genre_id）
+            # Insert the Song row (with no genre_id column)
             cur.execute(
                 """
                 INSERT INTO Song (title, artist_id, album_id, release_date)
@@ -308,10 +308,10 @@ def load_albums(
             )
             song_id = cur.lastrowid
 
-            # 在 SongGenre 中插入一条，体裁 = 专辑体裁
+            # Insert one row into SongGenre with the album genre
             cur.execute(
                 "INSERT INTO SongGenre (song_id, genre_id) VALUES (%s, %s)",
-                (song_id, album_genre_id),
+                (song_id, genre_id),
             )
 
     mydb.commit()
@@ -319,22 +319,22 @@ def load_albums(
 
 
 # ----------------------
-# 6. 歌曲最多的体裁
+# 6. Genres with the largest number of songs
 # ----------------------
 
 def get_top_song_genres(mydb, n: int) -> List[Tuple[str, int]]:
     """
-    Get n genres that are most represented in terms of number of songs in that genre.
-    Songs include singles as well as songs in albums.
+    Get the top n genres by number of songs.
+    A song with multiple genres contributes once to each genre.
 
-    在策略 B 下，歌曲体裁信息存储在 SongGenre，因此需要通过 SongGenre 关联 Genre。
+    Under strategy B, song-genre relationships are stored in SongGenre, so we must join through SongGenre to reach Genre.
 
     Args:
         mydb: database connection
         n: number of genres
 
     Returns:
-        List[Tuple[str,int]]: (genre,number_of_songs)，按歌数从多到少，tie 时按 genre 名字字典序。
+        List[Tuple[str,int]]: (genre, number_of_songs), sorted by number_of_songs desc, and by genre name ascending to break ties.
     """
     cur = mydb.cursor()
     cur.execute(
@@ -352,8 +352,9 @@ def get_top_song_genres(mydb, n: int) -> List[Tuple[str, int]]:
     rows = cur.fetchall()
     return [(name, count) for (name, count) in rows]
 
+
 # ----------------------
-# 7. 既有专辑又有单曲的 artist
+# 7. Artists who have both albums and singles
 # ----------------------
 
 def get_album_and_single_artists(mydb) -> Set[str]:
@@ -364,7 +365,7 @@ def get_album_and_single_artists(mydb) -> Set[str]:
         mydb: database connection
 
     Returns:
-        Set[str]: set of artist names
+        Set[str]: artist names.
     """
     cur = mydb.cursor()
     cur.execute(
@@ -372,11 +373,13 @@ def get_album_and_single_artists(mydb) -> Set[str]:
         SELECT DISTINCT a.name
         FROM Artist AS a
         WHERE EXISTS (
-            SELECT 1 FROM Album AS al
+            SELECT 1
+            FROM Album AS al
             WHERE al.artist_id = a.artist_id
         )
         AND EXISTS (
-            SELECT 1 FROM Song AS s
+            SELECT 1
+            FROM Song AS s
             WHERE s.artist_id = a.artist_id
               AND s.album_id IS NULL   -- single
         )
@@ -386,7 +389,7 @@ def get_album_and_single_artists(mydb) -> Set[str]:
 
 
 # ----------------------
-# 8. 加载用户
+# 8. Load users
 # ----------------------
 
 def load_users(mydb, users: List[str]) -> Set[str]:
@@ -407,19 +410,19 @@ def load_users(mydb, users: List[str]) -> Set[str]:
     seen_in_batch: Set[str] = set()
 
     for username in users:
-        # 本次函数调用内部的重复，直接 reject
+        # Reject duplicates within this function call (within the input list)
         if username in seen_in_batch:
             rejected.add(username)
             continue
         seen_in_batch.add(username)
 
-        # 数据库里已有，也 reject
+        # If the username already exists in the database, also reject
         cur.execute("SELECT user_id FROM User WHERE username = %s", (username,))
         if cur.fetchone():
             rejected.add(username)
             continue
 
-        # 否则插入
+        # Otherwise insert the new user
         cur.execute("INSERT INTO User (username) VALUES (%s)", (username,))
 
     mydb.commit()
@@ -427,7 +430,7 @@ def load_users(mydb, users: List[str]) -> Set[str]:
 
 
 # ----------------------
-# 9. 加载评分
+# 9. Load song ratings
 # ----------------------
 
 def load_song_ratings(
@@ -435,17 +438,23 @@ def load_song_ratings(
     song_ratings: List[Tuple[str, Tuple[str, str], int, str]],
 ) -> Set[Tuple[str, str, str]]:
     """
-    Load ratings for songs, which are either singles or songs in albums.
+    Add song ratings to the database.
+
+    A rating is applied to a song (single or album track).
+    It must satisfy:
+        - user exists
+        - song exists
+        - user has not already rated this song
+        - rating in 1..5
 
     Args:
         mydb: database connection
-        song_ratings: list of rating tuples of the form:
-            (rater, (artist, song), rating, date)
+        song_ratings: list of tuples:
+            (username, (artist_name, song_title), rating, rating_date_string)
 
     Returns:
-        Set[Tuple[str,str,str]]: set of (username,artist,song) tuples that are rejected, for any of the following
-        reasons:
-        (a) username (rater) is not in the database, or
+        Set of (username, artist_name, song_title) that were rejected, because:
+        (a) username not in database, or
         (b) username is in database but (artist,song) combination is not in the database, or
         (c) username has already rated (artist,song) combination, or
         (d) everything else is legit, but rating is not in range 1..5
@@ -456,13 +465,13 @@ def load_song_ratings(
     for username, (artist_name, song_title), rating, rating_date in song_ratings:
         key = (username, artist_name, song_title)
 
-        # (a) 用户不存在
+        # (a) User does not exist
         user_id = _get_user_id(mydb, username)
         if user_id is None:
             rejected.add(key)
             continue
 
-        # (b) 歌曲不存在（通过 artist + title）
+        # (b) Song does not exist (by artist + title)
         artist_id = _get_artist_id(mydb, artist_name)
         if artist_id is None:
             rejected.add(key)
@@ -473,12 +482,12 @@ def load_song_ratings(
             rejected.add(key)
             continue
 
-        # (d) rating 不在 [1,5]
+        # (d) rating is not in [1,5]
         if not (1 <= rating <= 5):
             rejected.add(key)
             continue
 
-        # (c) 这个用户已经评过这首歌
+        # (c) This user has already rated this song
         cur.execute(
             "SELECT 1 FROM Rating WHERE user_id = %s AND song_id = %s",
             (user_id, song_id),
@@ -487,7 +496,7 @@ def load_song_ratings(
             rejected.add(key)
             continue
 
-        # 合法评分，插入
+        # Rating is valid; insert it
         cur.execute(
             """
             INSERT INTO Rating (user_id, song_id, rating, rating_date)
@@ -501,7 +510,7 @@ def load_song_ratings(
 
 
 # ----------------------
-# 10. 被评分次数最多的歌曲
+# 10. Songs with the largest number of ratings
 # ----------------------
 
 def get_most_rated_songs(
@@ -510,19 +519,27 @@ def get_most_rated_songs(
     n: int,
 ) -> List[Tuple[str, str, int]]:
     """
-    Get the top n most rated songs in the given year range (both inclusive),
-    ranked from most rated to least rated.
-    "Most rated" refers to number of ratings, not actual rating scores.
-    Ties are broken in alphabetical order of song title. If the number of rated songs is less
-    than n, all rated songs are returned.
+    Get the n songs which received the largest number of ratings during a given period.
+    Break ties by alphabetical order by song title.
+
+    A rating is counted in the year of rating_date (not the song's release date).
+
+    Args:
+        mydb: database connection
+        year_range: (start_year, end_year)
+        n: how many results to return
+
+    Returns:
+        A list of (song_title, artist_name, number_of_ratings).
     """
     start_year, end_year = year_range
     cur = mydb.cursor()
+
     cur.execute(
         """
         SELECT s.title, a.name, COUNT(*) AS num_ratings
         FROM Rating AS r
-        JOIN Song AS s ON r.song_id = s.song_id
+        JOIN Song   AS s ON r.song_id = s.song_id
         JOIN Artist AS a ON s.artist_id = a.artist_id
         WHERE YEAR(r.rating_date) BETWEEN %s AND %s
         GROUP BY r.song_id, s.title, a.name
@@ -536,7 +553,7 @@ def get_most_rated_songs(
 
 
 # ----------------------
-# 11. 最活跃的用户
+# 11. Most engaged users
 # ----------------------
 
 def get_most_engaged_users(
@@ -545,16 +562,25 @@ def get_most_engaged_users(
     n: int,
 ) -> List[Tuple[str, int]]:
     """
-    Get the top n most engaged users, in terms of number of songs they have rated.
-    Break ties by alphabetical order of usernames.
+    Get the n users who gave ratings to the largest number of distinct songs in a given period.
+    Ties are broken by username (alphabetically).
+
+    Args:
+        mydb: database connection
+        year_range: (start_year, end_year)
+        n: how many results to return
+
+    Returns:
+        A list of (username, number_of_ratings).
     """
     start_year, end_year = year_range
     cur = mydb.cursor()
+
     cur.execute(
         """
         SELECT u.username, COUNT(*) AS num_rated
         FROM Rating AS r
-        JOIN User AS u ON r.user_id = u.user_id
+        JOIN User   AS u ON r.user_id = u.user_id
         WHERE YEAR(r.rating_date) BETWEEN %s AND %s
         GROUP BY r.user_id, u.username
         ORDER BY num_rated DESC, u.username ASC
@@ -567,7 +593,7 @@ def get_most_engaged_users(
 
 
 def main():
-    # 可以在这里写你自己的测试代码
+    # You can write your own ad-hoc tests here
     pass
 
 
